@@ -5,15 +5,21 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/fnproject/fn/api/common"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	EnvMaxTimeout     = "FN_MAX_TIMEOUT"
+	EnvMaxIdleTimeout = "FN_MAX_IDLE_TIMEOUT"
+	EnvMaxMemory      = "FN_MAX_MEMORY"
 )
 
 var (
-	// these are vars so that they can be configured. these apply
-	// across function & trigger (resource config)
-
 	MaxMemory      uint64 = 8 * 1024 // 8GB
 	MaxTimeout     int32  = 300      // 5m
 	MaxIdleTimeout int32  = 3600     // 1h
@@ -58,14 +64,8 @@ var (
 		code:  http.StatusBadRequest,
 		error: errors.New("Invalid Fn image"),
 	}
-	ErrFnsInvalidTimeout = err{
-		code:  http.StatusBadRequest,
-		error: fmt.Errorf("timeout value is out of range, must be between 0 and %d", MaxTimeout),
-	}
-	ErrFnsInvalidIdleTimeout = err{
-		code:  http.StatusBadRequest,
-		error: fmt.Errorf("idle_timeout value is out of range, must be between 0 and %d", MaxIdleTimeout),
-	}
+	ErrFnsInvalidTimeout err
+	ErrFnsInvalidIdleTimeout err
 	ErrFnsNotFound = err{
 		code:  http.StatusNotFound,
 		error: errors.New("Fn not found"),
@@ -75,6 +75,39 @@ var (
 		error: errors.New("Fn with specified name already exists"),
 	}
 )
+
+func init() {
+	if v := os.Getenv(EnvMaxTimeout); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 32); err == nil && i > 0 {
+			MaxTimeout = int32(i)
+		} else {
+			logrus.WithError(err).WithField("env", EnvMaxTimeout).Fatal("Failed to parse max timeout")
+		}
+	}
+	if v := os.Getenv(EnvMaxIdleTimeout); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 32); err == nil && i > 0 {
+			MaxIdleTimeout = int32(i)
+		} else {
+			logrus.WithError(err).WithField("env", EnvMaxIdleTimeout).Fatal("Failed to parse max idle timeout")
+		}
+	}
+	if v := os.Getenv(EnvMaxMemory); v != "" {
+		if i, err := strconv.ParseUint(v, 10, 64); err == nil && i > 0 {
+			MaxMemory = i
+		} else {
+			logrus.WithError(err).WithField("env", EnvMaxMemory).Fatal("Failed to parse max memory")
+		}
+	}
+
+	ErrFnsInvalidTimeout = err{
+		code:  http.StatusBadRequest,
+		error: fmt.Errorf("timeout value is out of range, must be between 0 and %d", MaxTimeout),
+	}
+	ErrFnsInvalidIdleTimeout = err{
+		code:  http.StatusBadRequest,
+		error: fmt.Errorf("idle_timeout value is out of range, must be between 0 and %d", MaxIdleTimeout),
+	}
+}
 
 // FnInvokeEndpointAnnotation is the annotation that exposes the fn invoke endpoint For want of a better place to put this it's here
 const FnInvokeEndpointAnnotation = "fnproject.io/fn/invokeEndpoint"
