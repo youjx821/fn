@@ -1,121 +1,239 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
+# ==============================================================================
+# fn (Fn Server) Docker 镜像构建脚本
+# 支持构建 x86(amd64) 与 arm(arm64) 架构镜像
+# 默认根据当前机器架构构建，支持镜像导出 (.tar.gz)
+# 保持与 fn-java-docker-base / fn-python-docker-base-311 规范一致
+# ==============================================================================
+
 set -e
 
-# 镜像名
-IMAGE="fnproject/fnserver"
-TAG="${TAG:-latest}"
-# 导出目录
-DIST_DIR="${DIST_DIR:-dist}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE_REPO="${IMAGE:-fnproject/fnserver}"
+DEFAULT_TAG="latest"
 
-# 解析参数: ./docker-build.sh [命令] [架构]
-# 命令: build(默认) / export / push
-# 架构: 默认根据当前机器架构
-detect_current_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64)  echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    *)
-      echo "无法识别当前架构: $(uname -m), 请显式指定 amd64 或 arm64" >&2
-      exit 1
-      ;;
-  esac
+# 颜色输出
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_usage() {
+    echo "用法: $0 [选项] [架构]"
+    echo ""
+    echo "架构参数 (可选):"
+    echo "  x86 | amd64 | x86_64      构建 x86_64 (linux/amd64) 镜像"
+    echo "  arm | arm64 | aarch64     构建 arm64 (linux/arm64) 镜像"
+    echo "  all                       依次构建 x86 与 arm 两个架构的镜像"
+    echo "  (默认: 自动检测当前主机架构)"
+    echo ""
+    echo "选项:"
+    echo "  -a, --arch <架构>          指定目标架构 (x86|arm|all)"
+    echo "  -e, --export              构建后导出镜像为 .tar.gz 压缩包"
+    echo "  -o, --output <路径>        导出文件路径或目录 (指定此项自动开启导出)"
+    echo "  -t, --tag <标签>           镜像标签 (默认: $DEFAULT_TAG)"
+    echo "  -p, --push                构建后推送到镜像仓库"
+    echo "  -h, --help                显示帮助信息"
+    echo ""
+    echo "兼容旧版命令格式:"
+    echo "  $0 build [架构]           构建镜像并导入本地 docker (默认)"
+    echo "  $0 export [架构]          构建镜像并导出压缩包"
+    echo "  $0 push [架构]            构建镜像并推送到镜像仓库"
+    echo ""
+    echo "示例:"
+    echo "  $0                        # 按当前架构构建"
+    echo "  $0 --export               # 按当前架构构建并导出"
+    echo "  $0 -a arm64 -e            # 构建 arm64 镜像并导出"
+    echo "  $0 all -e                 # 构建 x86 和 arm 镜像并全部导出"
+    echo "  $0 -a x86 -o ./images/    # 构建 x86 镜像并导出到指定目录"
+    echo "  $0 -a x86 -o ../aip-mcphelper/mcp-fn-server/images/ # 导出到 MCP-FN-Server 镜像目录"
 }
 
-usage() {
-  echo "用法: $0 [命令] [架构]"
-  echo "命令:"
-  echo "  build   构建镜像并导入本地 docker (默认)"
-  echo "  export  构建镜像并导出 gzip 压缩包到 ${DIST_DIR}/"
-  echo "  push    构建镜像并推送到镜像仓库"
-  echo "架构:"
-  echo "  amd64|x86: 仅构建 x86_64 镜像"
-  echo "  arm64|arm: 仅构建 arm64 镜像"
-  echo "  all: 同时构建两种架构"
-  echo "  不传参数: 根据当前机器架构构建 (默认)"
-  echo "环境变量:"
-  echo "  TAG=<tag>       镜像标签 (默认 latest)"
-  echo "  DIST_DIR=<dir>  导出目录 (默认 dist)"
-  echo "示例:"
-  echo "  $0                        # 构建当前架构"
-  echo "  $0 export arm64           # 构建 arm64 并导出压缩包"
-  echo "  $0 export all             # 构建双架构并分别导出压缩包"
-  echo "  $0 push                   # 推送当前架构镜像"
+# 检测当前机器架构
+detect_host_arch() {
+    local machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64|i386|i686)
+            echo "x86_64"
+            ;;
+        aarch64|arm64|armv8*|armv7*)
+            echo "arm64"
+            ;;
+        *)
+            echo "x86_64"
+            ;;
+    esac
 }
 
-# ---------- 解析命令 ----------
-CMD="build"
-if [ $# -ge 1 ]; then
-  case "$1" in
-    build|export|push) CMD="$1"; shift ;;
-    -h|--help)         usage; exit 0 ;;
-  esac
+# 规范化架构名称
+normalize_arch() {
+    local input=$1
+    case "$input" in
+        x86|x86_64|amd64)
+            echo "x86_64"
+            ;;
+        arm|arm64|aarch64)
+            echo "arm64"
+            ;;
+        all)
+            echo "all"
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+# 获取 Docker 平台标识
+get_docker_platform() {
+    local arch=$1
+    case "$arch" in
+        x86_64)
+            echo "linux/amd64"
+            ;;
+        arm64)
+            echo "linux/arm64"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+# 参数解析
+TARGET_ARCH=""
+DO_EXPORT=false
+DO_PUSH=false
+OUTPUT_PATH=""
+IMAGE_TAG="${TAG:-$DEFAULT_TAG}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--arch)
+            TARGET_ARCH="$2"
+            shift 2
+            ;;
+        -e|--export)
+            DO_EXPORT=true
+            shift
+            ;;
+        -o|--output)
+            DO_EXPORT=true
+            OUTPUT_PATH="$2"
+            shift 2
+            ;;
+        -t|--tag)
+            IMAGE_TAG="$2"
+            shift 2
+            ;;
+        -p|--push)
+            DO_PUSH=true
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        build)
+            shift
+            ;;
+        export)
+            DO_EXPORT=true
+            shift
+            ;;
+        push)
+            DO_PUSH=true
+            shift
+            ;;
+        x86|amd64|x86_64|arm|arm64|aarch64|all)
+            TARGET_ARCH="$1"
+            shift
+            ;;
+        *)
+            echo -e "${RED}未知参数: $1${NC}"
+            print_usage
+            exit 1
+            ;;
+    esac
+done
+
+# 如果未指定架构，默认使用当前主机架构
+if [ -z "$TARGET_ARCH" ]; then
+    TARGET_ARCH=$(detect_host_arch)
+    echo -e "${BLUE}[INFO]${NC} 未指定架构，自动检测当前主机架构: ${TARGET_ARCH}"
 fi
 
-# ---------- 解析架构 ----------
-PLATFORM_ARG="${1:-$(detect_current_arch)}"
-[ "$1" = "all" ] && shift
-
-case "$PLATFORM_ARG" in
-  amd64|x86)  PLATFORMS="linux/amd64" ;;
-  arm64|arm)  PLATFORMS="linux/arm64" ;;
-  all)        PLATFORMS="linux/amd64,linux/arm64" ;;
-  *)
-    usage
+TARGET_ARCH=$(normalize_arch "$TARGET_ARCH")
+if [ "$TARGET_ARCH" = "unknown" ]; then
+    echo -e "${RED}[ERROR] 不支持的目标架构: $TARGET_ARCH${NC}"
     exit 1
-    ;;
-esac
-
-# 确保 buildx 构建器存在并启用
-if ! docker buildx ls | grep -q "fnbuilder"; then
-  echo "创建多架构构建器 fnbuilder ..."
-  docker buildx create --name fnbuilder --use
 fi
-docker buildx use fnbuilder
 
-# ---------- 导出镜像: docker save + gzip 压缩 ----------
-# 文件名规范: fnserver_<os>_<arch>_<tag>.tar.gz, 如 fnserver_linux_amd64_latest.tar.gz
-export_image() {
-  local platform="$1" arch="${1##*/}"
-  local out_file="${DIST_DIR}/fnserver_linux_${arch}_${TAG}.tar.gz"
+# 检查 Docker 环境
+if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${RED}[ERROR] 未检测到 Docker，请先安装 Docker。${NC}"
+    exit 1
+fi
 
-  echo ">>> 导出 ${IMAGE}:${TAG}-${arch} -> ${out_file}"
-  mkdir -p "${DIST_DIR}"
-  docker save "${IMAGE}:${TAG}-${arch}" | gzip -6 > "${out_file}"
-  echo "    完成: $(du -h "${out_file}" | cut -f1) ${out_file}"
+# 单架构构建与导出逻辑
+build_single_arch() {
+    local arch=$1
+    local platform=$(get_docker_platform "$arch")
+    local full_image="${IMAGE_REPO}:${IMAGE_TAG}"
+
+    echo ""
+    echo -e "${GREEN}=========================================${NC}"
+    echo -e "${GREEN}开始构建镜像: ${full_image} (${arch} / ${platform})${NC}"
+    echo -e "${GREEN}=========================================${NC}"
+
+    local build_cmd="docker build"
+    if docker buildx version >/dev/null 2>&1; then
+        build_cmd="docker buildx build --load"
+    fi
+
+    if [ "$DO_PUSH" = true ]; then
+        echo -e "${BLUE}[INFO]${NC} 正在构建并推送到仓库..."
+        docker buildx build --platform "$platform" -t "$full_image" --push "$SCRIPT_DIR"
+        echo -e "${GREEN}✓ 镜像推送完成: ${full_image} (${platform})${NC}"
+    else
+        $build_cmd --platform "$platform" -t "$full_image" "$SCRIPT_DIR"
+        echo -e "${GREEN}✓ 镜像构建完成: ${full_image} (${platform})${NC}"
+    fi
+
+    if [ "$DO_EXPORT" = true ]; then
+        local target_file=""
+        local default_filename="fnproject_fnserver_${IMAGE_TAG}_${arch}.tar.gz"
+
+        if [ -z "$OUTPUT_PATH" ]; then
+            target_file="$SCRIPT_DIR/$default_filename"
+        elif [ -d "$OUTPUT_PATH" ] || [[ "$OUTPUT_PATH" == */ ]]; then
+            mkdir -p "$OUTPUT_PATH"
+            target_file="${OUTPUT_PATH%/}/$default_filename"
+        else
+            target_file="$OUTPUT_PATH"
+            mkdir -p "$(dirname "$target_file")"
+        fi
+
+        echo ""
+        echo -e "${BLUE}[INFO]${NC} 正在导出镜像到: $target_file ..."
+        docker save "$full_image" | gzip -1 > "$target_file"
+
+        local file_size=$(du -h "$target_file" 2>/dev/null | cut -f1 || ls -lh "$target_file" | awk '{print $5}')
+        echo -e "${GREEN}✓ 镜像导出成功: $target_file (大小: $file_size)${NC}"
+    fi
 }
 
-# ---------- 按命令执行 ----------
-case "$CMD" in
-  push)
-    # 推送: 多架构合并为单一 manifest, 单架构直接推送
-    echo "构建并推送: ${IMAGE}:${TAG} [${PLATFORMS}]"
-    docker buildx build --platform "${PLATFORMS}" -t "${IMAGE}:${TAG}" --push .
-    ;;
+# 执行构建
+if [ "$TARGET_ARCH" = "all" ]; then
+    build_single_arch "x86_64"
+    build_single_arch "arm64"
+else
+    build_single_arch "$TARGET_ARCH"
+fi
 
-  export)
-    # 导出: 逐架构构建(本地 load)并导出压缩包
-    for PLATFORM in $(echo "$PLATFORMS" | tr ',' ' '); do
-      ARCH="${PLATFORM##*/}"
-      echo ">>> 构建 ${IMAGE}:${TAG}-${ARCH} [${PLATFORM}]"
-      docker buildx build --platform "${PLATFORM}" \
-        -t "${IMAGE}:${TAG}-${ARCH}" --load .
-      export_image "${PLATFORM}"
-    done
-    ;;
-
-  build)
-    if [ "${PLATFORMS}" = "linux/amd64,linux/arm64" ]; then
-      # 本地 load 不支持多架构单标签, 按架构分别构建并打上架构后缀标签
-      for PLATFORM in $(echo "$PLATFORMS" | tr ',' ' '); do
-        ARCH="${PLATFORM##*/}"
-        echo ">>> 构建 ${IMAGE}:${TAG}-${ARCH}"
-        docker buildx build --platform "${PLATFORM}" \
-          -t "${IMAGE}:${TAG}-${ARCH}" --load .
-      done
-    else
-      # 单架构, 标签不带架构后缀
-      echo "构建: ${IMAGE}:${TAG} [${PLATFORMS}]"
-      docker buildx build --platform "${PLATFORMS}" -t "${IMAGE}:${TAG}" --load .
-    fi
-    ;;
-esac
+echo ""
+echo -e "${GREEN}=========================================${NC}"
+echo -e "${GREEN}✓ fnserver 构建处理完毕!${NC}"
+echo -e "${GREEN}=========================================${NC}"
